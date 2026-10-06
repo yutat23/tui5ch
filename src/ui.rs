@@ -746,11 +746,9 @@ fn posts(f: &mut Frame, app: &mut App, area: Rect, p: Palette) {
         };
         let travel = inner.height - thumb_len;
         let thumb_top = inner.y
-            + if max_scroll == 0 {
-                0
-            } else {
-                (scroll * travel as usize / max_scroll) as u16
-            };
+            + (scroll * travel as usize)
+                .checked_div(max_scroll)
+                .unwrap_or(0) as u16;
         let rect = Rect::new(inner.right(), inner.y, 1, inner.height);
         for row in rect.y..rect.bottom() {
             f.render_widget(

@@ -390,11 +390,9 @@ impl App {
         if let Some(bar) = self.post_scrollbar {
             let travel = bar.rect.height.saturating_sub(bar.thumb_len) as usize;
             let top = (row as i32 - bar.rect.y as i32 - grab).clamp(0, travel as i32) as usize;
-            let scroll = if travel == 0 {
-                0
-            } else {
-                (top * bar.max_scroll + travel / 2) / travel
-            };
+            let scroll = (top * bar.max_scroll + travel / 2)
+                .checked_div(travel)
+                .unwrap_or(0);
             self.scroll_posts_to(scroll)?;
         }
         Ok(())
