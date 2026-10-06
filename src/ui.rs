@@ -68,6 +68,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.post_scrollbar = None;
     app.post_starts.clear();
     app.thread_hits.clear();
+    app.tab_hits.clear();
+    app.command_hits.clear();
+    app.tab_area = Rect::default();
     app.sort_hits.clear();
     app.areas = [Rect::default(); 3];
     app.dividers = [Rect::default(); 3];
@@ -107,10 +110,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             " tui5ch ",
             Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            " / 5ちゃんねる terminal reader ",
-            Style::default().fg(p.muted),
-        ),
+        Span::styled(" / 5ch・エッヂ・したらば ", Style::default().fg(p.muted)),
         Span::styled(mode, Style::default().fg(p.gold)),
         Span::styled(
             if app.busy.is_empty() {
@@ -121,43 +121,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             Style::default().fg(p.gold),
         ),
     ]);
-    let tabs = if app.tabs.is_empty() {
-        Line::from(Span::styled(
-            " 板を選択 → スレを選択 → 読む   /   u: URLを直接開く",
-            Style::default().fg(p.muted),
-        ))
-    } else {
-        Line::from(
-            app.tabs
-                .iter()
-                .enumerate()
-                .map(|(i, t)| {
-                    Span::styled(
-                        format!(
-                            " {}:{} ",
-                            i + 1,
-                            t.data.thread.title.chars().take(22).collect::<String>()
-                        ),
-                        Style::default()
-                            .fg(if i == app.tab { p.accent } else { p.muted })
-                            .bg(if i == app.tab { p.selected } else { p.bg }),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )
-    };
     f.render_widget(
         Paragraph::new(header),
         Rect::new(rows[0].x, rows[0].y, rows[0].width, 1),
     );
-    f.render_widget(
-        Paragraph::new(tabs).wrap(Wrap { trim: false }),
+    tabs(
+        f,
+        app,
         Rect::new(
             rows[0].x,
             rows[0].y + 1,
             rows[0].width,
             rows[0].height.saturating_sub(2),
         ),
+        p,
     );
     app.dividers[2] = Rect::new(
         rows[0].x,
@@ -248,46 +225,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         threads(f, app, columns[1], p);
         posts(f, app, columns[2], p);
     }
-    let foot = Text::from(vec![
-        Line::from(Span::styled(
-            format!(" {}", app.status.replace('\n', " ")),
-            Style::default().fg(p.gold),
-        )),
-        Line::from(vec![
-            Span::styled(" Tab", Style::default().fg(p.accent)),
-            Span::raw(" ペイン  "),
-            Span::styled("j/k", Style::default().fg(p.accent)),
-            Span::raw(" 移動  "),
-            Span::styled("/", Style::default().fg(p.accent)),
-            Span::raw(" 検索  "),
-            Span::styled("r", Style::default().fg(p.accent)),
-            Span::raw(" 更新  "),
-            Span::styled("z", Style::default().fg(p.accent)),
-            Span::raw(" 表示切替  "),
-            Span::styled("?", Style::default().fg(p.accent)),
-            Span::raw(" ヘルプ  q 終了"),
-        ]),
-        Line::from(vec![
-            Span::styled(" w", Style::default().fg(p.accent)),
-            Span::raw(" 書込  "),
-            Span::styled("R", Style::default().fg(p.accent)),
-            Span::raw(" 引用  "),
-            Span::styled("B", Style::default().fg(p.accent)),
-            Span::raw(" スレ立て  "),
-            Span::styled("境界DnD", Style::default().fg(p.accent)),
-            Span::raw(" サイズ変更"),
-        ]),
-    ]);
-    f.render_widget(
-        Paragraph::new(foot)
-            .style(Style::default().fg(p.muted))
-            .block(
-                Block::default()
-                    .borders(Borders::TOP)
-                    .border_style(Style::default().fg(p.border)),
-            ),
-        rows[2],
-    );
+    footer(f, app, rows[2], p);
     for (area, focus) in app
         .areas
         .into_iter()
@@ -309,6 +247,177 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
     }
     modal(f, app, p);
+}
+fn footer(f: &mut Frame, app: &mut App, area: Rect, p: Palette) {
+    use crossterm::event::KeyCode;
+    f.render_widget(
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(p.border)),
+        area,
+    );
+    f.render_widget(
+        Paragraph::new(format!(" {}", app.status.replace('\n', " ")))
+            .style(Style::default().fg(p.gold)),
+        Rect::new(area.x, area.y + 1, area.width, 1),
+    );
+    let common = vec![
+        ("?", "ヘルプ", KeyCode::Char('?')),
+        ("u", "URL", KeyCode::Char('u')),
+        ("Tab", "ペイン", KeyCode::Tab),
+        ("/", "検索", KeyCode::Char('/')),
+        ("r", "更新", KeyCode::Char('r')),
+        ("z", "表示", KeyCode::Char('z')),
+        ("q", "終了", KeyCode::Char('q')),
+    ];
+    let contextual = match app.focus {
+        Focus::Boards => vec![
+            ("Enter", "開閉", KeyCode::Enter),
+            ("f", "お気に入り", KeyCode::Char('f')),
+            ("v", "一覧切替", KeyCode::Char('v')),
+        ],
+        Focus::Threads => vec![
+            ("Enter", "開く", KeyCode::Enter),
+            ("f", "お気に入り", KeyCode::Char('f')),
+            ("v", "一覧切替", KeyCode::Char('v')),
+            ("B", "スレ立て", KeyCode::Char('B')),
+        ],
+        Focus::Posts => vec![
+            ("w", "返信", KeyCode::Char('w')),
+            ("R", "引用", KeyCode::Char('R')),
+            ("B", "スレ立て", KeyCode::Char('B')),
+            ("n", "未読", KeyCode::Char('n')),
+            ("e", "保存", KeyCode::Char('e')),
+        ],
+    };
+    for (row, commands) in [common, contextual].into_iter().enumerate() {
+        let y = area.y + 2 + row as u16;
+        if y >= area.bottom() {
+            break;
+        }
+        let mut x = area.x;
+        for (key, label, code) in commands {
+            let width =
+                unicode_width::UnicodeWidthStr::width(format!("[{key} {label}] ").as_str()) as u16;
+            if x + width > area.right() {
+                break;
+            }
+            let rect = Rect::new(x, y, width, 1);
+            let text = Line::from(vec![
+                Span::raw("["),
+                Span::styled(
+                    key,
+                    Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(" {label}] ")),
+            ]);
+            f.render_widget(
+                Paragraph::new(text).style(Style::default().fg(p.muted)),
+                rect,
+            );
+            app.command_hits.push((rect, code));
+            x += width;
+        }
+    }
+}
+fn fit_text(text: &str, width: usize) -> String {
+    if unicode_width::UnicodeWidthStr::width(text) <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut fitted = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let cells = ch.width().unwrap_or(0);
+        if used + cells > width - 1 {
+            break;
+        }
+        fitted.push(ch);
+        used += cells;
+    }
+    fitted.push('…');
+    fitted
+}
+fn tabs(f: &mut Frame, app: &mut App, area: Rect, p: Palette) {
+    use crate::app::TabAction;
+    app.tab_area = area;
+    if area.height == 0 || area.width < 10 {
+        return;
+    }
+    if app.tabs.is_empty() {
+        f.render_widget(
+            Paragraph::new(" 板 → スレ → レス / u: URLを開く").style(Style::default().fg(p.muted)),
+            area,
+        );
+        return;
+    }
+    let available = area.width.saturating_sub(6);
+    let width = (available / 3).clamp(14, 30).min(available);
+    let columns = (available / width).max(1) as usize;
+    let capacity = columns * area.height as usize;
+    app.tab_offset = app.tab_offset.min(app.tabs.len().saturating_sub(capacity));
+    if app.tab < app.tab_offset || app.tab >= app.tab_offset + capacity {
+        app.tab_offset = (app.tab / capacity) * capacity;
+    }
+    app.tab_offset = app.tab_offset.min(app.tabs.len().saturating_sub(capacity));
+    for (rect, text, action) in [
+        (Rect::new(area.x, area.y, 3, 1), "[‹]", TabAction::Previous),
+        (
+            Rect::new(area.right() - 3, area.y, 3, 1),
+            "[›]",
+            TabAction::Next,
+        ),
+    ] {
+        f.render_widget(
+            Paragraph::new(text).style(Style::default().fg(p.accent)),
+            rect,
+        );
+        app.tab_hits.push((rect, action));
+    }
+    for (slot, index) in (app.tab_offset..app.tabs.len()).take(capacity).enumerate() {
+        let rect = Rect::new(
+            area.x + 3 + (slot % columns) as u16 * width,
+            area.y + (slot / columns) as u16,
+            width,
+            1,
+        );
+        let active = index == app.tab;
+        let tab = &app.tabs[index];
+        let unread = tab.data.posts.len().saturating_sub(
+            app.states
+                .get(&tab.data.thread.url())
+                .map(|s| s.read)
+                .unwrap_or(0),
+        );
+        let unread_label = if unread == 0 {
+            String::new()
+        } else if width >= 24 {
+            format!("(+{unread}) ")
+        } else {
+            "•".into()
+        };
+        let label = format!(" {}:{}{}", index + 1, unread_label, tab.data.thread.title);
+        let style = Style::default()
+            .fg(if active { p.accent } else { p.muted })
+            .bg(if active { p.selected } else { p.bg })
+            .add_modifier(if active {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            });
+        f.render_widget(Block::default().style(style), rect);
+        let label_area = Rect::new(rect.x, rect.y, rect.width - 2, 1);
+        f.render_widget(
+            Paragraph::new(fit_text(&label, label_area.width as usize)).style(style),
+            label_area,
+        );
+        let close = Rect::new(rect.right() - 2, rect.y, 2, 1);
+        f.render_widget(Paragraph::new("× ").style(style), close);
+        app.tab_hits.push((label_area, TabAction::Select(index)));
+        app.tab_hits.push((close, TabAction::Close(index)));
+    }
 }
 fn boards(f: &mut Frame, app: &mut App, area: Rect, p: Palette) {
     let rows = app.board_tree();
@@ -829,11 +938,14 @@ fn help_text(p: Palette) -> Text<'static> {
 # 上部のスレタブを切り替える
 `[` 前のスレ   `]` 次のスレ   `x` 現在のスレタブを閉じる
 上部の「1:タイトル」「2:タイトル」はタブ番号です。
+タブをクリックして切り替え、右端の「x」・中クリックで閉じます。
+左右の矢印・タブ欄のホイールでも切り替えられます。
 `[` / `]` はIMEを英数入力にして押してください。
 `1` / `2` / `3` はペイン選択用です。
 
 # マウス・表示
 板・スレをクリックして開く / 各ペイン右上の「更新」で手動更新
+画面下の `[キー 操作]` はクリックして実行できます。
 カテゴリはクリック・`Enter`で開閉、`→`で展開、`←`で閉じる
 板を右クリック・`f`でお気に入りを切り替え
 お気に入り内の順序: ドラッグ、または `Ctrl+↑` / `Ctrl+↓`
@@ -869,6 +981,7 @@ fn help_text(p: Palette) -> Text<'static> {
 
 # ヘルプ・終了
 `j` / `k`・`↑` / `↓` ヘルプをスクロール   `PgUp` / `PgDn` ページ移動
+マウスのホイールでもヘルプをスクロールできます。
 `?` / `Esc` / `q` ヘルプを閉じる   `Ctrl+C` アプリを終了
 通常画面では `q` でアプリを終了"#;
     let key_style = Style::default()
@@ -1169,24 +1282,189 @@ pub fn snapshot(app: &mut App, path: &Path) -> Result<()> {
     let backend = ratatui::backend::TestBackend::new(120, 36);
     let mut terminal = ratatui::Terminal::new(backend)?;
     terminal.draw(|f| draw(f, app))?;
-    let buffer = terminal.backend().buffer();
+    std::fs::write(path, screen_text(terminal.backend().buffer()))?;
+    Ok(())
+}
+fn screen_text(buffer: &ratatui::buffer::Buffer) -> String {
     let mut text = String::new();
-    for y in 0..36 {
-        let mut x = 0;
-        while x < 120 {
+    for y in buffer.area.y..buffer.area.bottom() {
+        let mut x = buffer.area.x;
+        while x < buffer.area.right() {
             let c = &buffer[(x, y)];
             text.push_str(c.symbol());
             x += unicode_width::UnicodeWidthStr::width(c.symbol()).max(1) as u16;
         }
         text.push('\n');
     }
-    std::fs::write(path, text)?;
-    Ok(())
+    text
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mouse_tabs_stay_visible_and_close_without_switching_other_threads() -> Result<()> {
+        use crate::{app::TabAction, store::Store};
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let dir = std::env::temp_dir().join(format!(
+            "tui5ch-tabs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let mut app = App::new(Store::open(&dir)?, true, true)?;
+        let original = app.current().unwrap().data.clone();
+        for index in 0..20 {
+            let mut data = original.clone();
+            data.thread.key = (1791200000 + index).to_string();
+            data.thread.title = format!("日本語の長いスレタイトル {index}");
+            app.store.save_thread(&data)?;
+            app.open_thread(data.thread)?;
+        }
+        let mouse = |kind, rect: Rect| MouseEvent {
+            kind,
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut narrow = ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 10))?;
+        narrow.draw(|f| draw(f, &mut app))?;
+        assert!(
+            app.tab_hits
+                .iter()
+                .any(|(_, a)| matches!(a, TabAction::Select(20)))
+        );
+        assert!(screen_text(narrow.backend().buffer()).contains("21:"));
+        let next = app
+            .tab_hits
+            .iter()
+            .find(|(_, a)| matches!(a, TabAction::Next))
+            .unwrap()
+            .0;
+        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), next))?;
+        assert_eq!(app.tab, 0);
+        app.select_tab(1)?;
+        let active = app.current().unwrap().data.thread.url();
+        let mut wide = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36))?;
+        wide.draw(|f| draw(f, &mut app))?;
+        let close = app
+            .tab_hits
+            .iter()
+            .find(|(_, a)| matches!(a, TabAction::Close(0)))
+            .unwrap()
+            .0;
+        app.mouse(mouse(MouseEventKind::Down(MouseButton::Left), close))?;
+        assert_eq!(app.current().unwrap().data.thread.url(), active);
+        assert_eq!(app.tab, 0);
+        wide.draw(|f| draw(f, &mut app))?;
+        let selected = app
+            .tab_hits
+            .iter()
+            .find(|(_, a)| matches!(a, TabAction::Select(0)))
+            .unwrap()
+            .0;
+        let count = app.tabs.len();
+        app.mouse(mouse(MouseEventKind::Down(MouseButton::Middle), selected))?;
+        assert_eq!(app.tabs.len(), count - 1);
+        wide.draw(|f| draw(f, &mut app))?;
+        app.mouse(mouse(MouseEventKind::ScrollDown, app.tab_area))?;
+        assert_eq!(app.tab, 1);
+        drop(app);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+    #[test]
+    fn help_wheel_scrolls_and_modal_clicks_do_not_touch_background() -> Result<()> {
+        use crate::store::Store;
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let dir = std::env::temp_dir().join(format!(
+            "tui5ch-help-wheel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let mut app = App::new(Store::open(&dir)?, true, true)?;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))?;
+        app.mode = Mode::Help(0);
+        terminal.draw(|f| draw(f, &mut app))?;
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 40,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.mouse(wheel(MouseEventKind::ScrollDown))?;
+        assert!(matches!(app.mode, Mode::Help(3)));
+        let tab = app.tab;
+        let count = app.tabs.len();
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: app.tab_area.right() - 1,
+            row: app.tab_area.y,
+            modifiers: KeyModifiers::NONE,
+        })?;
+        assert_eq!(app.tab, tab);
+        assert_eq!(app.tabs.len(), count);
+        app.mouse(wheel(MouseEventKind::ScrollUp))?;
+        assert!(matches!(app.mode, Mode::Help(0)));
+        drop(app);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+    #[test]
+    fn footer_commands_work_by_mouse_and_respect_modal_input() -> Result<()> {
+        use crate::store::Store;
+        use crossterm::event::{
+            KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "tui5ch-footer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let mut app = App::new(Store::open(&dir)?, true, true)?;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36))?;
+        let click = |app: &mut App, code: KeyCode| -> Result<()> {
+            let rect = app
+                .command_hits
+                .iter()
+                .find(|(_, key)| *key == code)
+                .unwrap()
+                .0;
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x,
+                row: rect.y,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        terminal.draw(|f| draw(f, &mut app))?;
+        assert!(screen_text(terminal.backend().buffer()).contains("[u URL]"));
+        click(&mut app, KeyCode::Char('u'))?;
+        assert!(matches!(app.mode, Mode::Input(Prompt::Url, _)));
+        click(&mut app, KeyCode::Char('q'))?;
+        assert!(app.running);
+        assert!(matches!(app.mode, Mode::Input(Prompt::Url, _)));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?;
+        let layout = app.config.layout.clone();
+        click(&mut app, KeyCode::Char('z'))?;
+        assert_ne!(app.config.layout, layout);
+        click(&mut app, KeyCode::Char('?'))?;
+        assert!(matches!(app.mode, Mode::Help(0)));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?;
+        app.focus = Focus::Posts;
+        terminal.draw(|f| draw(f, &mut app))?;
+        click(&mut app, KeyCode::Char('w'))?;
+        assert!(matches!(app.mode, Mode::Draft(_)));
+        assert!(app.busy.is_empty());
+        drop(app);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
     #[test]
     fn japanese_width_and_aa() {
         assert_eq!(wrap_text("日本語abc", 4, true), vec!["日本", "語ab", "c"]);
@@ -1681,15 +1959,10 @@ mod tests {
         app.move_selection(1000)?;
         terminal.draw(|f| draw(f, &mut app))?;
         assert!(
-            terminal
-                .backend()
-                .buffer()
-                .content
-                .iter()
-                .map(|c| c.symbol())
-                .collect::<String>()
+            screen_text(terminal.backend().buffer())
                 .replace(' ', "")
-                .contains(&title.replace(' ', ""))
+                .contains(&title.replace(' ', "")),
+            "Expected title: {title}"
         );
         assert_eq!(app.config.header_height, 5);
         let saved = app.store.config()?;

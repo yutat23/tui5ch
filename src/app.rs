@@ -95,6 +95,13 @@ pub struct PostScrollbar {
     pub thumb_top: u16,
     pub thumb_len: u16,
 }
+#[derive(Clone, Copy)]
+pub enum TabAction {
+    Select(usize),
+    Close(usize),
+    Previous,
+    Next,
+}
 pub struct Tab {
     pub data: ThreadData,
     pub selected: usize,
@@ -220,6 +227,10 @@ pub struct App {
     pub rules: Vec<NgRule>,
     pub tabs: Vec<Tab>,
     pub tab: usize,
+    pub tab_offset: usize,
+    pub tab_area: ratatui::layout::Rect,
+    pub tab_hits: Vec<(ratatui::layout::Rect, TabAction)>,
+    pub command_hits: Vec<(ratatui::layout::Rect, KeyCode)>,
     pub focus: Focus,
     pub view: View,
     pub board_sel: usize,
@@ -255,6 +266,8 @@ pub struct App {
     network: Network,
     posting: crate::posting::Posting,
     pub compose: Option<crate::posting::Draft>,
+    pending_open: HashSet<String>,
+    requested_thread: Option<String>,
 }
 impl App {
     pub fn new(store: Store, demo: bool, offline: bool) -> Result<Self> {
@@ -274,6 +287,10 @@ impl App {
             rules,
             tabs: vec![],
             tab: 0,
+            tab_offset: 0,
+            tab_area: Default::default(),
+            tab_hits: vec![],
+            command_hits: vec![],
             focus: Focus::Boards,
             view: View::Board,
             board_sel: 0,
@@ -309,6 +326,8 @@ impl App {
             network: Network::start(),
             posting: crate::posting::Posting::start(),
             compose: None,
+            pending_open: HashSet::new(),
+            requested_thread: None,
         };
         if demo {
             let (boards, data) = crate::model::demo();
@@ -333,10 +352,17 @@ impl App {
                 app.store.set("boards", &app.boards)?;
             }
             let session: Vec<String> = app.store.get("session")?.unwrap_or_default();
+            let active = app.store.get::<Option<String>>("active-thread")?.flatten();
             for url in session.into_iter().take(20) {
                 if let Some(data) = app.store.load_thread(&url)? {
-                    app.open_data(data)?;
+                    app.open_data_with_activation(data, false)?;
                 }
+            }
+            if !app.tabs.is_empty() {
+                let selected = active
+                    .and_then(|url| app.tabs.iter().position(|t| t.data.thread.url() == url))
+                    .unwrap_or(app.tabs.len() - 1);
+                app.select_tab(selected)?;
             }
             if offline {
                 app.set_view(View::Logs)?;
@@ -398,7 +424,53 @@ impl App {
         Ok(())
     }
     pub fn mouse(&mut self, m: MouseEvent) -> Result<()> {
+        if !matches!(self.mode, Mode::Normal) {
+            if let Mode::Help(scroll) = &mut self.mode {
+                let limit = crate::ui::help_scroll_limit(self.viewport);
+                *scroll = match m.kind {
+                    MouseEventKind::ScrollDown => scroll.saturating_add(3).min(limit),
+                    MouseEventKind::ScrollUp => scroll.saturating_sub(3),
+                    _ => *scroll,
+                };
+            }
+            return Ok(());
+        }
         let position = ratatui::layout::Position::new(m.column, m.row);
+        if m.kind == MouseEventKind::Down(MouseButton::Left)
+            && let Some((_, code)) = self
+                .command_hits
+                .iter()
+                .find(|(rect, _)| rect.contains(position))
+        {
+            return self.key(KeyEvent::new(*code, KeyModifiers::NONE));
+        }
+        if self.tab_area.contains(position) {
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some((_, action)) =
+                        self.tab_hits.iter().find(|(r, _)| r.contains(position))
+                    {
+                        match *action {
+                            TabAction::Select(index) => self.select_tab(index)?,
+                            TabAction::Close(index) => self.close_tab(index)?,
+                            TabAction::Previous => self.cycle_tab(-1)?,
+                            TabAction::Next => self.cycle_tab(1)?,
+                        }
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Middle) => {
+                    if let Some((_, TabAction::Select(index) | TabAction::Close(index))) =
+                        self.tab_hits.iter().find(|(r, _)| r.contains(position))
+                    {
+                        self.close_tab(*index)?;
+                    }
+                }
+                MouseEventKind::ScrollDown => self.cycle_tab(1)?,
+                MouseEventKind::ScrollUp => self.cycle_tab(-1)?,
+                _ => {}
+            }
+            return Ok(());
+        }
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(bar) = self.post_scrollbar
@@ -813,24 +885,82 @@ impl App {
     pub fn open_input(&mut self, input: &str) -> Result<()> {
         match parse_url(input)? {
             Target::Board(board) => {
-                let idx = if let Some(i) = self.boards.iter().position(|b| b.url == board.url) {
-                    i
-                } else {
-                    self.boards.push(board);
-                    self.boards.len() - 1
-                };
-                self.board_filter.clear();
-                self.board_sel = self
-                    .board_indices()
-                    .iter()
-                    .position(|&i| i == idx)
-                    .unwrap_or(0);
-                self.store.set("boards", &self.boards)?;
+                self.select_board(&board)?;
                 self.load_board()?;
             }
-            Target::Thread(thread) => self.open_thread(thread)?,
+            Target::Thread(thread) => {
+                self.select_board(&thread.board)?;
+                self.load_board()?;
+                self.open_thread(thread)?;
+            }
         }
         Ok(())
+    }
+    fn select_board(&mut self, board: &Board) -> Result<()> {
+        let index = if let Some(index) = self.boards.iter().position(|b| b.url == board.url) {
+            index
+        } else {
+            self.boards.push(board.clone());
+            self.store.set("boards", &self.boards)?;
+            self.boards.len() - 1
+        };
+        self.board_filter.clear();
+        self.board_sel = self
+            .board_indices()
+            .iter()
+            .position(|&i| i == index)
+            .unwrap_or(0);
+        self.expanded
+            .insert(format!("category:{}", self.boards[index].category));
+        self.board_cursor = self
+            .board_tree()
+            .iter()
+            .position(|row| matches!(row, BoardRow::Board(i, _) if *i == index))
+            .unwrap_or(0);
+        self.store.set("board-expanded", &self.expanded)?;
+        Ok(())
+    }
+    pub fn select_tab(&mut self, index: usize) -> Result<()> {
+        if index >= self.tabs.len() {
+            return Ok(());
+        }
+        self.tab = index;
+        self.requested_thread = Some(self.tabs[index].data.thread.url());
+        self.focus = Focus::Posts;
+        self.post_filter.clear();
+        self.mark_read()?;
+        self.save_session()
+    }
+    fn cycle_tab(&mut self, step: isize) -> Result<()> {
+        if !self.tabs.is_empty() {
+            self.select_tab(
+                (self.tab as isize + step).rem_euclid(self.tabs.len() as isize) as usize,
+            )?;
+        }
+        Ok(())
+    }
+    pub fn close_tab(&mut self, index: usize) -> Result<()> {
+        if index >= self.tabs.len() {
+            return Ok(());
+        }
+        let closed = self.tabs.remove(index).data.thread.url();
+        self.pending_open.remove(&closed);
+        let active_closed = index == self.tab;
+        if index < self.tab {
+            self.tab -= 1;
+        }
+        self.tab = self.tab.min(self.tabs.len().saturating_sub(1));
+        if active_closed {
+            self.post_filter.clear();
+            if self.tabs.is_empty() {
+                self.focus = Focus::Threads;
+                self.requested_thread = None;
+            } else {
+                self.select_tab(self.tab)?;
+            }
+        }
+        self.tab_hits.clear();
+        self.save_session()
     }
     pub fn open_thread(&mut self, thread: Thread) -> Result<()> {
         if !self.boards.iter().any(|b| b.url == thread.board.url) {
@@ -839,34 +969,47 @@ impl App {
         }
         let url = thread.url();
         if let Some(i) = self.tabs.iter().position(|t| t.data.thread.url() == url) {
-            self.tab = i;
-            self.focus = Focus::Posts;
-            self.post_filter.clear();
-            return Ok(());
+            return self.select_tab(i);
         }
-        if let Some(data) = self
+        let cached = self
             .store
             .load_thread(&url)?
-            .filter(|d| !d.posts.is_empty())
-        {
+            .filter(|d| !d.posts.is_empty());
+        let needs_open = cached.is_none();
+        if let Some(data) = cached {
             self.open_data(data)?;
         } else if self.offline {
             self.status = "このスレのログは保存されていません".into();
+        }
+        if !self.offline && needs_open {
+            self.requested_thread = Some(url.clone());
+            self.pending_open.insert(url.clone());
         }
         self.request(url, Request::Thread(thread));
         Ok(())
     }
     fn open_data(&mut self, data: ThreadData) -> Result<()> {
+        self.open_data_with_activation(data, true)
+    }
+    fn open_data_with_activation(&mut self, data: ThreadData, activate: bool) -> Result<()> {
         let url = data.thread.url();
         if let Some(i) = self.tabs.iter().position(|t| t.data.thread.url() == url) {
             let tab = &mut self.tabs[i];
             if tab.follow {
                 tab.selected = data.posts.len().saturating_sub(1);
+                tab.jump_bottom = true;
             }
             tab.data = data;
             tab.selected = tab.selected.min(tab.data.posts.len().saturating_sub(1));
             tab.refreshed = Instant::now();
-            self.mark_read()?;
+            if activate {
+                self.select_tab(i)?;
+            } else if i == self.tab
+                && self.focus == Focus::Posts
+                && matches!(self.mode, Mode::Normal)
+            {
+                self.mark_read()?;
+            }
             return Ok(());
         }
         let state = self.states.entry(url.clone()).or_default();
@@ -887,10 +1030,9 @@ impl App {
             rendered: None,
             jump_bottom: false,
         });
-        self.tab = self.tabs.len() - 1;
-        self.focus = Focus::Posts;
-        self.post_filter.clear();
-        self.mark_read()?;
+        if activate {
+            self.select_tab(self.tabs.len() - 1)?;
+        }
         self.save_session()?;
         Ok(())
     }
@@ -913,6 +1055,10 @@ impl App {
                 .iter()
                 .map(|t| t.data.thread.url())
                 .collect::<Vec<_>>(),
+        )?;
+        self.store.set(
+            "active-thread",
+            &self.current().map(|t| t.data.thread.url()),
         )
     }
     pub fn set_view(&mut self, view: View) -> Result<()> {
@@ -972,18 +1118,47 @@ impl App {
                     self.busy.remove("menu");
                     match data {
                         Ok(mut boards) => {
+                            let selected = self
+                                .board_indices()
+                                .get(self.board_sel)
+                                .map(|&i| self.boards[i].url.clone());
+                            let cursor = self.board_tree().get(self.board_cursor).cloned();
+                            let cursor_url = match &cursor {
+                                Some(BoardRow::Board(index, _)) => {
+                                    Some(self.boards[*index].url.clone())
+                                }
+                                _ => None,
+                            };
                             for b in &self.boards {
                                 if !boards.iter().any(|n| n.url == b.url) {
                                     boards.push(b.clone());
                                 }
                             }
-                            let empty = self.boards.is_empty();
                             self.boards = boards;
                             self.store.set("boards", &self.boards)?;
-                            self.status = format!("板一覧を更新: {}板", self.boards.len());
-                            if empty {
-                                self.board_sel = 0;
+                            let indices = self.board_indices();
+                            self.board_sel = selected
+                                .and_then(|url| {
+                                    indices.iter().position(|&i| self.boards[i].url == url)
+                                })
+                                .unwrap_or(self.board_sel.min(indices.len().saturating_sub(1)));
+                            if let Some(url) = cursor_url {
+                                if let Some(index) = self.boards.iter().position(|b| b.url == url) {
+                                    if !self.board_tree().iter().any(
+                                        |row| matches!(row, BoardRow::Board(i, _) if *i == index),
+                                    ) {
+                                        self.expanded.insert(format!(
+                                            "category:{}",
+                                            self.boards[index].category
+                                        ));
+                                        self.store.set("board-expanded", &self.expanded)?;
+                                    }
+                                    self.board_cursor = self.board_tree().iter().position(|row| matches!(row, BoardRow::Board(i, _) if *i == index)).unwrap_or(0);
+                                }
+                            } else if let Some(BoardRow::Category(key, _, _)) = cursor {
+                                self.board_cursor = self.board_tree().iter().position(|row| matches!(row, BoardRow::Category(k, _, _) if *k == key)).unwrap_or(0);
                             }
+                            self.status = format!("板一覧を更新: {}板", self.boards.len());
                         }
                         Err(e) => {
                             self.status = format!("板一覧: {e} / u で板URLを直接指定できます")
@@ -1008,10 +1183,9 @@ impl App {
                                     .get(self.board_sel)
                                     .is_some_and(|&i| self.boards[i].url == board.url)
                             {
+                                let selected = self.selected_thread_url();
                                 self.threads = threads;
-                                self.thread_sel = self
-                                    .thread_sel
-                                    .min(self.thread_indices().len().saturating_sub(1));
+                                self.restore_thread_selection(selected);
                             }
                             self.status = format!("{} のスレ一覧を更新", board.name);
                         }
@@ -1021,18 +1195,7 @@ impl App {
                     }
                 }
                 Response::Thread(thread, data) => {
-                    self.busy.remove(&thread.url());
-                    match data {
-                        Ok(data) => {
-                            self.store.save_thread(&data)?;
-                            self.status =
-                                format!("{} / {}レス取得", data.thread.title, data.posts.len());
-                            self.open_data(data)?;
-                        }
-                        Err(e) => {
-                            self.status = format!("スレ取得: {e} / 保存済みログは保持しています")
-                        }
-                    }
+                    self.receive_thread(thread, data)?;
                 }
             }
         }
@@ -1055,6 +1218,50 @@ impl App {
                 }
                 self.request(thread.url(), Request::Thread(thread));
             }
+        }
+        Ok(())
+    }
+    fn selected_thread_url(&self) -> Option<String> {
+        self.thread_indices()
+            .get(self.thread_sel)
+            .map(|&i| self.threads[i].url())
+    }
+    fn restore_thread_selection(&mut self, selected: Option<String>) {
+        self.thread_sel = selected
+            .and_then(|url| {
+                self.thread_indices()
+                    .iter()
+                    .position(|&i| self.threads[i].url() == url)
+            })
+            .unwrap_or(
+                self.thread_sel
+                    .min(self.thread_indices().len().saturating_sub(1)),
+            );
+    }
+    fn receive_thread(&mut self, thread: Thread, result: Result<ThreadData, String>) -> Result<()> {
+        let url = thread.url();
+        self.busy.remove(&url);
+        let requested = self.pending_open.remove(&url);
+        match result {
+            Ok(data) => {
+                self.store.save_thread(&data)?;
+                let selected = self.selected_thread_url();
+                for listed in &mut self.threads {
+                    if listed.url() == url {
+                        *listed = data.thread.clone();
+                    }
+                }
+                self.restore_thread_selection(selected);
+                self.status = format!("{} / {}レス取得", data.thread.title, data.posts.len());
+                let open = self.tabs.iter().any(|t| t.data.thread.url() == url);
+                if open || requested {
+                    let activate = requested
+                        && self.requested_thread.as_deref() == Some(&url)
+                        && matches!(self.mode, Mode::Normal);
+                    self.open_data_with_activation(data, activate)?;
+                }
+            }
+            Err(error) => self.status = format!("スレ取得: {error} / 保存済みログは保持しています"),
         }
         Ok(())
     }
@@ -1746,22 +1953,41 @@ impl App {
             KeyCode::Char('u') => self.prompt(Prompt::Url, String::new()),
             KeyCode::Char('g') => self.prompt(Prompt::Jump, String::new()),
             KeyCode::Char('L') => self.prompt(Prompt::Logs, String::new()),
-            KeyCode::Char('r') => match self.focus {
-                Focus::Boards => self.request_menu(),
-                Focus::Threads => {
-                    if self.view == View::Board {
-                        self.load_board()?;
-                    } else {
-                        self.set_view(self.view)?;
+            KeyCode::Char('r') => {
+                match self.focus {
+                    Focus::Boards => self.request_menu(),
+                    Focus::Threads => {
+                        if self.view == View::Board {
+                            if let Some(&index) = self.board_indices().get(self.board_sel) {
+                                let board = self.boards[index].clone();
+                                if self.offline {
+                                    let selected = self.selected_thread_url();
+                                    if let Some(saved) =
+                                        self.store.get(&format!("subjects:{}", board.url))?
+                                    {
+                                        self.threads = saved;
+                                        self.restore_thread_selection(selected);
+                                    }
+                                    self.status = "オフラインでは更新できません。保存済み一覧を表示しています".into();
+                                } else {
+                                    self.request(
+                                        format!("subjects:{}", board.url),
+                                        Request::Subjects(board),
+                                    );
+                                }
+                            }
+                        } else {
+                            self.set_view(self.view)?;
+                        }
+                    }
+                    Focus::Posts => {
+                        if let Some(t) = self.current() {
+                            let t = t.data.thread.clone();
+                            self.request(t.url(), Request::Thread(t));
+                        }
                     }
                 }
-                Focus::Posts => {
-                    if let Some(t) = self.current() {
-                        let t = t.data.thread.clone();
-                        self.request(t.url(), Request::Thread(t));
-                    }
-                }
-            },
+            }
             KeyCode::Char('f') => self.favorite()?,
             KeyCode::Char('v') => self.set_view(match self.view {
                 View::Board => View::Favorites,
@@ -1932,25 +2158,13 @@ impl App {
                 );
             }
             KeyCode::Char('[') => {
-                if !self.tabs.is_empty() {
-                    self.tab = (self.tab + self.tabs.len() - 1) % self.tabs.len();
-                    self.focus = Focus::Posts;
-                    self.post_filter.clear();
-                }
+                self.cycle_tab(-1)?;
             }
             KeyCode::Char(']') => {
-                if !self.tabs.is_empty() {
-                    self.tab = (self.tab + 1) % self.tabs.len();
-                    self.focus = Focus::Posts;
-                    self.post_filter.clear();
-                }
+                self.cycle_tab(1)?;
             }
             KeyCode::Char('x') => {
-                if !self.tabs.is_empty() {
-                    self.tabs.remove(self.tab);
-                    self.tab = self.tab.min(self.tabs.len().saturating_sub(1));
-                    self.save_session()?;
-                }
+                self.close_tab(self.tab)?;
             }
             KeyCode::Char('p') => {
                 if let Some(t) = self.current() {
@@ -2040,7 +2254,7 @@ pub fn run(app: &mut App) -> Result<()> {
                     }
                     Ok(())
                 }
-                Event::Mouse(m) if matches!(app.mode, Mode::Normal) => app.mouse(m),
+                Event::Mouse(m) => app.mouse(m),
                 _ => Ok(()),
             };
             if let Err(e) = result {
@@ -2055,6 +2269,204 @@ pub fn run(app: &mut App) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_app(label: &str) -> Result<(std::path::PathBuf, App)> {
+        let dir = std::env::temp_dir().join(format!(
+            "tui5ch-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let app = App::new(Store::open(&dir)?, true, true)?;
+        Ok((dir, app))
+    }
+    #[test]
+    fn active_tab_and_empty_session_survive_restart() -> Result<()> {
+        let (dir, mut app) = test_app("active-tab")?;
+        let second = app.threads[1].clone();
+        app.open_thread(second)?;
+        app.select_tab(0)?;
+        let active = app.current().unwrap().data.thread.url();
+        drop(app);
+        let mut restored = App::new(Store::open(&dir)?, false, true)?;
+        assert_eq!(restored.tabs.len(), 2);
+        assert_eq!(restored.current().unwrap().data.thread.url(), active);
+        restored.close_tab(0)?;
+        restored.close_tab(0)?;
+        drop(restored);
+        let empty = App::new(Store::open(&dir)?, false, true)?;
+        assert!(empty.tabs.is_empty());
+        drop(empty);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+    #[test]
+    fn background_refresh_preserves_focus_unread_and_closed_tabs() -> Result<()> {
+        let (dir, mut app) = test_app("background")?;
+        let first = app.current().unwrap().data.clone();
+        let first_url = first.thread.url();
+        let read = app.states[&first_url].read;
+        app.open_thread(app.threads[1].clone())?;
+        let active = app.current().unwrap().data.thread.url();
+        app.focus = Focus::Threads;
+        app.thread_filter = "試".into();
+        app.mode = Mode::Input(Prompt::Search, Editor::new("入力中".into()));
+        app.tabs[0].follow = true;
+        let mut update = first;
+        let mut post = update.posts.last().unwrap().clone();
+        post.number += 1;
+        update.posts.push(post);
+        update.thread.count = update.posts.len();
+        app.receive_thread(update.thread.clone(), Ok(update.clone()))?;
+        assert_eq!(app.current().unwrap().data.thread.url(), active);
+        assert_eq!(app.focus, Focus::Threads);
+        assert_eq!(app.thread_filter, "試");
+        assert!(matches!(app.mode, Mode::Input(Prompt::Search, _)));
+        assert_eq!(app.states[&first_url].read, read);
+        assert_eq!(app.tabs[0].selected, 8);
+        app.close_tab(0)?;
+        assert_eq!(app.current().unwrap().data.thread.url(), active);
+        app.receive_thread(update.thread.clone(), Ok(update))?;
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.store.load_thread(&first_url)?.unwrap().posts.len(), 9);
+        drop(app);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+    #[test]
+    fn cached_thread_refresh_does_not_reactivate_the_posts_pane() -> Result<()> {
+        let (dir, mut app) = test_app("cached-refresh")?;
+        let thread = app.threads[1].clone();
+        let data = app.store.load_thread(&thread.url())?.unwrap();
+        let (tx, requests) = std::sync::mpsc::channel();
+        let (_responses, rx) = std::sync::mpsc::channel();
+        app.network = Network { tx, rx };
+        app.offline = false;
+        app.open_thread(thread.clone())?;
+        assert_eq!(app.current().unwrap().data.thread.url(), thread.url());
+        assert!(app.pending_open.is_empty());
+        assert!(matches!(requests.try_recv()?, Request::Thread(_)));
+        app.focus = Focus::Boards;
+        app.post_filter = "検索を維持".into();
+        app.receive_thread(thread, Ok(data))?;
+        assert_eq!(app.focus, Focus::Boards);
+        assert_eq!(app.post_filter, "検索を維持");
+        drop(app);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+    #[test]
+    fn out_of_order_requests_activate_only_the_latest_thread() -> Result<()> {
+        let (dir, mut app) = test_app("out-of-order")?;
+        let original = app.current().unwrap().data.thread.url();
+        let mut a = app.current().unwrap().data.clone();
+        let mut b = a.clone();
+        a.thread.key = "1791200001".into();
+        b.thread.key = "1791200002".into();
+        app.pending_open.extend([a.thread.url(), b.thread.url()]);
+        app.requested_thread = Some(b.thread.url());
+        app.receive_thread(a.thread.clone(), Ok(a))?;
+        assert_eq!(app.current().unwrap().data.thread.url(), original);
+        let latest = b.thread.url();
+        app.receive_thread(b.thread.clone(), Ok(b))?;
+        assert_eq!(app.current().unwrap().data.thread.url(), latest);
+        assert_eq!(app.tabs.len(), 3);
+        drop(app);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+    #[test]
+    fn refresh_preserves_search_and_selection_after_sort_changes() -> Result<()> {
+        let (dir, mut app) = test_app("refresh-selection")?;
+        app.focus = Focus::Threads;
+        app.thread_filter = "試".into();
+        app.sort_threads(ThreadSort::Count);
+        app.thread_sel = 1;
+        let selected = app.selected_thread_url();
+        app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))?;
+        assert_eq!(app.thread_filter, "試");
+        assert_eq!(app.selected_thread_url(), selected);
+        let (tx, _requests) = std::sync::mpsc::channel();
+        let (responses, rx) = std::sync::mpsc::channel();
+        app.network = Network { tx, rx };
+        let mut threads = app.threads.clone();
+        threads[1].count = 100;
+        threads.reverse();
+        responses.send(Response::Subjects(app.boards[0].clone(), Ok(threads)))?;
+        app.tick()?;
+        assert_eq!(app.thread_filter, "試");
+        assert_eq!(app.selected_thread_url(), selected);
+        assert_eq!(app.thread_sel, 0);
+        drop(app);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+    #[test]
+    fn menu_refresh_preserves_selected_board_and_category_cursor() -> Result<()> {
+        let (dir, mut app) = test_app("menu-selection")?;
+        let board = parse_url("https://bbs.eddibb.cc/liveedge/")?;
+        let Target::Board(board) = board else {
+            panic!("expected board");
+        };
+        app.select_board(&board)?;
+        let selected = app.boards[app.board_indices()[app.board_sel]].url.clone();
+        let (tx, _requests) = std::sync::mpsc::channel();
+        let (responses, rx) = std::sync::mpsc::channel();
+        app.network = Network { tx, rx };
+        let mut boards = app.boards.clone();
+        boards.reverse();
+        boards
+            .iter_mut()
+            .find(|b| b.url == selected)
+            .unwrap()
+            .category = "新しいカテゴリ".into();
+        responses.send(Response::Menu(Ok(boards)))?;
+        app.tick()?;
+        assert_eq!(app.boards[app.board_indices()[app.board_sel]].url, selected);
+        let Some(BoardRow::Board(index, _)) = app.board_tree().get(app.board_cursor).cloned()
+        else {
+            panic!("selected board should stay visible");
+        };
+        assert_eq!(app.boards[index].url, selected);
+        assert!(app.expanded.contains("category:新しいカテゴリ"));
+        app.board_cursor = app.board_tree().iter().position(|row| matches!(row, BoardRow::Category(key, _, _) if key == "category:新しいカテゴリ")).unwrap();
+        let mut boards = app.boards.clone();
+        boards.reverse();
+        responses.send(Response::Menu(Ok(boards)))?;
+        app.tick()?;
+        assert!(
+            matches!(app.board_tree().get(app.board_cursor), Some(BoardRow::Category(key, _, _)) if key == "category:新しいカテゴリ")
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+    #[test]
+    fn url_navigation_expands_and_selects_the_right_category() -> Result<()> {
+        let (dir, mut app) = test_app("url-category")?;
+        app.board_filter = "デモ".into();
+        app.open_input("https://jbbs.shitaraba.net/game/12345/")?;
+        assert!(app.expanded.contains("category:したらば"));
+        assert!(app.board_filter.is_empty());
+        let Some(BoardRow::Board(index, _)) = app.board_tree().get(app.board_cursor).cloned()
+        else {
+            panic!("board should be visible and selected");
+        };
+        assert_eq!(
+            app.boards[index].url,
+            "https://jbbs.shitaraba.net/game/12345/"
+        );
+        app.open_input("https://bbs.eddibb.cc/liveedge/1791209783/")?;
+        assert!(app.expanded.contains("category:エッヂ"));
+        let Some(BoardRow::Board(index, _)) = app.board_tree().get(app.board_cursor).cloned()
+        else {
+            panic!();
+        };
+        assert_eq!(app.boards[index].site(), Site::Edge);
+        drop(app);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
     #[test]
     fn unicode_editor() {
         let mut e = Editor::new("日本語".into());
