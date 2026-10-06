@@ -2,18 +2,22 @@ name: Release
 
 on:
   push:
+    branches: [main]
     tags: ['v*']
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: tui5ch-release
   cancel-in-progress: false
 
 jobs:
   validate:
+    if: github.ref_type == 'tag' || startsWith(github.event.head_commit.message, 'chore: release v')
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -22,9 +26,19 @@ jobs:
         with:
           python-version: '3.13'
       - name: Validate tag, version and changelog
+        id: release
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: python scripts/release.py validate --tag "$RELEASE_TAG" --output dist
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          if [[ "$REF_TYPE" == "tag" ]]; then
+            RELEASE_TAG="$REF_NAME"
+          else
+            RELEASE_TAG="${COMMIT_MESSAGE#chore: release }"
+          fi
+          python scripts/release.py validate --tag "$RELEASE_TAG" --output dist
+          printf 'tag=%s\n' "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
   build:
     needs: validate
@@ -65,9 +79,10 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
+          overwrite: true
 
   publish:
-    needs: build
+    needs: [validate, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -85,16 +100,47 @@ jobs:
           merge-multiple: true
       - name: Prepare release notes and checksums
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
         run: |
           python scripts/release.py validate --tag "$RELEASE_TAG" --output .local/release
           python scripts/release.py checksums --output dist
+      - name: Create or verify annotated release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          if ref=$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" 2>/dev/null); then
+            tag_sha=$(jq -r '.object.sha' <<< "$ref")
+            if [[ $(jq -r '.object.type' <<< "$ref") == "tag" ]]; then
+              tag_sha=$(gh api "repos/$GH_REPO/git/tags/$tag_sha" --jq '.object.sha')
+            fi
+            if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
+              echo "Release tag points to a different commit; refusing to move it."
+              exit 1
+            fi
+          else
+            tag_sha=$(gh api "repos/$GH_REPO/git/tags" \
+              -f tag="$RELEASE_TAG" -f message="tui5ch $RELEASE_TAG" \
+              -f object="$GITHUB_SHA" -f type=commit --jq '.sha')
+            gh api "repos/$GH_REPO/git/refs" -f ref="refs/tags/$RELEASE_TAG" -f sha="$tag_sha"
+          fi
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
         run: |
+          if gh release view "$RELEASE_TAG" --json assets > .local/release/existing.json 2>/dev/null; then
+            expected=$(find dist -maxdepth 1 -type f -printf '%f\n' | sort)
+            actual=$(jq -r '.assets[].name' .local/release/existing.json | sort)
+            if [[ "$actual" != "$expected" ]]; then
+              echo "Release already exists with different assets; check it before retrying."
+              exit 1
+            fi
+            echo "Release and all expected assets already exist."
+            exit 0
+          fi
           flags=()
           if [[ "$RELEASE_TAG" == *-* ]]; then flags+=(--prerelease); fi
           gh release create "$RELEASE_TAG" dist/* \

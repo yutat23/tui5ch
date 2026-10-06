@@ -60,6 +60,8 @@ git push origin v0.1.0
 
 タグのpushで [Releaseワークフロー](.github/workflows/release.yml) が開始します。タグ・Cargoバージョン・日付付きCHANGELOGの一致を確認し、3OSでfmt・テスト・Clippy・ビルドを実行します。成功後にGitHub Releaseを公開し、Windows向けZIP、Linux・macOS向けtar.gz、`SHA256SUMS` を添付します。各ランナーのホストアーキテクチャをファイル名に付けます。全CPUアーキテクチャへのクロスビルドは行いません。`v0.2.0-beta.1` のようなタグはprereleaseになります。
 
+タグを手元で作れない場合は、リリース準備を `chore: release v0.1.0` のような完全一致のコミットメッセージで `main` にpushしても開始できます。バージョン・CHANGELOGの検証と全OSのビルド成功後、CIがそのコミットに注釈付きタグを作成してReleaseを公開します。既存タグが別のコミットを指している場合は停止し、タグの付け替えは行いません。通常のコミットからリリースは作成しません。
+
 リリース説明にはCHANGELOGの該当バージョンを使います。各アーカイブには実行ファイルと明示した公開ドキュメントだけを含めます。LinuxバイナリはUbuntuランナー上でビルドしたglibc依存のバイナリです。Linux・macOSでの実機TUI操作は別途確認してください。
 
 ローカルで配布処理を確認する場合はPython 3.11以上を使用します。
