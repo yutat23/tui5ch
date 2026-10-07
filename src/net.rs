@@ -6,7 +6,10 @@ use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
 use std::{
     io::Read,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver, Sender},
+    },
     time::Duration,
 };
 
@@ -26,39 +29,59 @@ pub struct Network {
 }
 impl Network {
     pub fn start() -> Self {
+        let client = Client::builder()
+            .user_agent(concat!(
+                env!("CARGO_PKG_NAME"),
+                "/",
+                env!("CARGO_PKG_VERSION"),
+                " (+terminal reader)"
+            ))
+            .connect_timeout(Duration::from_secs(8))
+            .timeout(Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .map_err(|error| error.to_string());
+        Self::with_client(client)
+    }
+    fn with_client(client: Result<Client, String>) -> Self {
         let (tx, work) = mpsc::channel();
         let (result, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let client = Client::builder()
-                .user_agent("tui5ch/0.1 (+terminal reader)")
-                .connect_timeout(Duration::from_secs(8))
-                .timeout(Duration::from_secs(20))
-                .redirect(reqwest::redirect::Policy::limited(5))
-                .build();
-            for request in work {
-                let client = client.as_ref().map_err(|e| e.to_string());
-                let response = match request {
-                    Request::Menu(url) => Response::Menu(client.and_then(|c| {
-                        fetch(c, &url)
-                            .and_then(|s| parse::menu(&s))
-                            .map_err(|e| e.to_string())
-                    })),
-                    Request::Subjects(mut board) => {
-                        let data = client
-                            .and_then(|c| fetch_subjects(c, &mut board).map_err(|e| e.to_string()));
-                        Response::Subjects(board, data)
+        let work = Arc::new(Mutex::new(work));
+        for _ in 0..3 {
+            let work = Arc::clone(&work);
+            let result = result.clone();
+            let client = client.clone();
+            std::thread::spawn(move || {
+                loop {
+                    let request = work.lock().ok().and_then(|queue| queue.recv().ok());
+                    let Some(request) = request else {
+                        break;
+                    };
+                    let client = client.as_ref().map_err(|e| e.clone());
+                    let response = match request {
+                        Request::Menu(url) => Response::Menu(client.and_then(|c| {
+                            fetch(c, &url)
+                                .and_then(|s| parse::menu(&s))
+                                .map_err(|e| e.to_string())
+                        })),
+                        Request::Subjects(mut board) => {
+                            let data = client.and_then(|c| {
+                                fetch_subjects(c, &mut board).map_err(|e| e.to_string())
+                            });
+                            Response::Subjects(board, data)
+                        }
+                        Request::Thread(thread) => {
+                            let data = client
+                                .and_then(|c| fetch_thread(c, &thread).map_err(|e| e.to_string()));
+                            Response::Thread(thread, data)
+                        }
+                    };
+                    if result.send(response).is_err() {
+                        break;
                     }
-                    Request::Thread(thread) => {
-                        let data = client
-                            .and_then(|c| fetch_thread(c, &thread).map_err(|e| e.to_string()));
-                        Response::Thread(thread, data)
-                    }
-                };
-                if result.send(response).is_err() {
-                    break;
                 }
-            }
-        });
+            });
+        }
         Self { tx, rx }
     }
 }
@@ -190,6 +213,75 @@ pub fn open_url(url: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn slow_menu_does_not_block_thread_loading() -> Result<()> {
+        use std::{io::Write, net::TcpListener};
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let root = format!("http://{}", listener.local_addr()?);
+        let (started, menu_started) = mpsc::channel();
+        let (release, menu_release) = mpsc::channel();
+        let menu_release = Arc::new(Mutex::new(menu_release));
+        let server = std::thread::spawn(move || {
+            let mut handlers = vec![];
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let started = started.clone();
+                let menu_release = Arc::clone(&menu_release);
+                handlers.push(std::thread::spawn(move || {
+                    let mut bytes = [0; 4096];
+                    let count = stream.read(&mut bytes).unwrap();
+                    let menu = String::from_utf8_lossy(&bytes[..count]).starts_with("GET /menu ");
+                    let body = if menu {
+                        started.send(()).unwrap();
+                        menu_release
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(10))
+                            .unwrap();
+                        "<B>test</B><A HREF=\"https://egg.5ch.io/software/\">software</A>"
+                    } else {
+                        "名無し<>sage<>date ID:abc<>読み込み完了<>スレ\n"
+                    };
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                }));
+            }
+            for handler in handlers {
+                handler.join().unwrap();
+            }
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+        let network = Network::with_client(Ok(client));
+        network.tx.send(Request::Menu(format!("{root}/menu")))?;
+        menu_started.recv_timeout(Duration::from_secs(5))?;
+        network.tx.send(Request::Thread(Thread {
+            key: "1791209783".into(),
+            title: "スレ".into(),
+            count: 0,
+            board: Board {
+                name: "test".into(),
+                category: "test".into(),
+                url: format!("{root}/test/"),
+            },
+        }))?;
+        let first = network.rx.recv_timeout(Duration::from_secs(5));
+        release.send(())?;
+        assert!(matches!(first?, Response::Thread(_, Ok(_))));
+        assert!(matches!(
+            network.rx.recv_timeout(Duration::from_secs(5))?,
+            Response::Menu(_)
+        ));
+        server.join().unwrap();
+        Ok(())
+    }
     #[test]
     fn external_board_and_thread_requests() -> Result<()> {
         use std::{io::Write, net::TcpListener};
