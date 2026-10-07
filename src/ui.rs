@@ -1294,6 +1294,7 @@ fn screen_text(buffer: &ratatui::buffer::Buffer) -> String {
             text.push_str(c.symbol());
             x += unicode_width::UnicodeWidthStr::width(c.symbol()).max(1) as u16;
         }
+        text.truncate(text.trim_end_matches(' ').len());
         text.push('\n');
     }
     text

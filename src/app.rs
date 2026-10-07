@@ -353,7 +353,7 @@ impl App {
             }
             let session: Vec<String> = app.store.get("session")?.unwrap_or_default();
             let active = app.store.get::<Option<String>>("active-thread")?.flatten();
-            for url in session.into_iter().take(20) {
+            for url in session {
                 if let Some(data) = app.store.load_thread(&url)? {
                     app.open_data_with_activation(data, false)?;
                 }
@@ -2283,16 +2283,22 @@ mod tests {
     #[test]
     fn active_tab_and_empty_session_survive_restart() -> Result<()> {
         let (dir, mut app) = test_app("active-tab")?;
-        let second = app.threads[1].clone();
-        app.open_thread(second)?;
-        app.select_tab(0)?;
+        let data = app.current().unwrap().data.clone();
+        for index in 1..25 {
+            let mut data = data.clone();
+            data.thread.key = format!("179129{index:04}");
+            app.store.save_thread(&data)?;
+            app.open_thread(data.thread)?;
+        }
+        app.select_tab(23)?;
         let active = app.current().unwrap().data.thread.url();
         drop(app);
         let mut restored = App::new(Store::open(&dir)?, false, true)?;
-        assert_eq!(restored.tabs.len(), 2);
+        assert_eq!(restored.tabs.len(), 25);
         assert_eq!(restored.current().unwrap().data.thread.url(), active);
-        restored.close_tab(0)?;
-        restored.close_tab(0)?;
+        while !restored.tabs.is_empty() {
+            restored.close_tab(0)?;
+        }
         drop(restored);
         let empty = App::new(Store::open(&dir)?, false, true)?;
         assert!(empty.tabs.is_empty());
